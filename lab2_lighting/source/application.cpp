@@ -1,0 +1,979 @@
+#include "application.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <vector>
+
+#include <imgui.h>
+
+#include "gizmos.hpp"
+#include "graphics.hpp"
+#include "math.hpp"
+#include "mesh.hpp"
+#include "plane.hpp"
+#include "shader_data.hpp"
+#include "torus.hpp"
+
+namespace application {
+
+namespace {
+
+constexpr int max_segments = 128; 	// шаги по кругу u
+constexpr int max_sides = 64; 		// шаги вокруг трубки v
+
+constexpr uint32_t initial_light_capacity = 16;
+constexpr uint32_t initial_gizmo_capacity = 1024;
+constexpr float gizmo_cube_half_size = 0.08f;
+constexpr float gizmo_cone_length = 1.2f;
+
+enum Projection : int {
+	ProjectionPerspective,
+	ProjectionOrthographic,
+};
+
+enum Trajectory : int {
+	TrajectoryNone,
+	TrajectoryCircle,
+	TrajectoryLissajous,
+	TrajectoryRose,
+};
+
+struct Material {
+	math::Vector3 albedo;
+	math::Vector3 specular;
+	float shininess;
+};
+
+struct PointLightSettings {
+	math::Vector3 position;
+	math::Vector3 color;
+	float intensity;
+};
+
+struct SpotLightSettings {
+	math::Vector3 position;
+	math::Vector3 direction;
+	math::Vector3 color;
+	float intensity;
+	float inner_degrees;
+	float outer_degrees;
+};
+
+struct CameraSettings {
+	int mode = ProjectionPerspective;
+	math::Vector3 position = { 0.0f, -2.5f, -7.0f };
+	math::Vector3 rotation_degrees = { -20.0f, 0.0f, 0.0f };
+	float fov_degrees = 60.0f;
+	float z_near = 0.1f;
+	float z_far = 100.0f;
+};
+
+CameraSettings camera;
+
+struct {
+	math::Vector3 position = { 0.0f, 0.0f, 0.0f };
+	math::Vector3 rotation_degrees = { 60.0f, 0.0f, 0.0f };
+	math::Vector3 scale = { 1.0f, 1.0f, 1.0f };
+} transform;
+
+struct {
+	bool playing = true;
+	float speed = 1.0f;
+	float time = 0.0f;
+	int trajectory = TrajectoryLissajous;
+	float radius = 1.5f;
+	float depth = 1.0f;
+	int frequency_x = 3;
+	int frequency_y = 2;
+	int petals = 3;
+	math::Vector3 spin_degrees_per_second = { 0.0f, 45.0f, 0.0f };
+} animation;
+
+struct {
+	Material material = { { 1.0f, 1.0f, 1.0f }, { 0.6f, 0.6f, 0.6f }, 32.0f };
+	bool use_vertex_colors = true;
+} torus_appearance;
+
+struct {
+	Material material = { { 0.55f, 0.55f, 0.6f }, { 0.25f, 0.25f, 0.25f }, 16.0f };
+	float height = 3.0f;
+	float size = 6.0f;
+} floor_settings;
+
+struct {
+	math::Vector3 color = { 1.0f, 1.0f, 1.0f };
+	float intensity = 0.1f;
+} ambient;
+
+struct {
+	math::Vector3 direction = { 0.4f, 1.0f, 0.6f };
+	math::Vector3 color = { 1.0f, 0.95f, 0.85f };
+	float intensity = 0.5f;
+} directional;
+
+std::vector<PointLightSettings> point_lights = {
+	{ { -1.0f, -2.0f, -2.5f }, { 1.0f, 0.55f, 0.25f }, 4.0f },
+};
+
+std::vector<SpotLightSettings> spot_lights = {
+	{ { 1.5f, -3.5f, 0.0f }, { -0.3f, 1.0f, 0.0f }, { 0.35f, 0.65f, 1.0f }, 20.0f, 15.0f, 25.0f },
+};
+
+bool show_gizmos = true;
+
+torus::Parameters torus_parameters = { 1.0f, 0.4f, 48, 24 };
+bool mesh_dirty = true;
+
+double previous_time = -1.0;
+math::Matrix4 torus_model = math::Matrix4::identity();
+math::Matrix4 torus_normal_matrix = math::Matrix4::identity();
+math::Matrix4 floor_model = math::Matrix4::identity();
+math::Matrix4 floor_normal_matrix = math::Matrix4::identity();
+
+graphics::Buffer torus_vertex_buffer;
+graphics::Buffer torus_index_buffer;
+uint32_t torus_index_count = 0;
+
+graphics::Buffer floor_vertex_buffer;
+graphics::Buffer floor_index_buffer;
+uint32_t floor_index_count = 0;
+
+graphics::Buffer scene_uniform_buffer;
+graphics::Buffer torus_uniform_buffer;
+graphics::Buffer floor_uniform_buffer;
+
+graphics::Buffer point_light_buffer;
+uint32_t point_light_capacity = 0;
+graphics::Buffer spot_light_buffer;
+uint32_t spot_light_capacity = 0;
+
+graphics::Buffer gizmo_vertex_buffer;
+uint32_t gizmo_vertex_capacity = 0;
+uint32_t gizmo_triangle_vertex_count = 0;
+uint32_t gizmo_line_vertex_count = 0;
+
+VkDescriptorSetLayout vk_scene_set_layout;
+VkDescriptorSetLayout vk_model_set_layout;
+VkDescriptorPool vk_descriptor_pool;
+VkDescriptorSet vk_scene_set;
+VkDescriptorSet vk_torus_set;
+VkDescriptorSet vk_floor_set;
+
+VkPipelineLayout vk_model_pipeline_layout;
+VkPipelineLayout vk_gizmo_pipeline_layout;
+VkPipeline vk_model_pipeline;
+VkPipeline vk_gizmo_triangle_pipeline;
+VkPipeline vk_gizmo_line_pipeline;
+
+void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                           const graphics::Buffer& buffer) {
+	const VkDescriptorBufferInfo buffer_info = {
+		.buffer = buffer.buffer,
+		.offset = 0,
+		.range = buffer.size,
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = set,
+		.dstBinding = binding,
+		.descriptorCount = 1,
+		.descriptorType = type,
+		.pBufferInfo = &buffer_info,
+	};
+
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+bool growBuffer(graphics::Buffer& buffer, uint32_t& capacity, size_t count,
+                VkDeviceSize element_size, VkBufferUsageFlags usage) {
+	if (count <= capacity) {
+		return false;
+	}
+
+	const uint32_t new_capacity = std::max(uint32_t(count), capacity * 2);
+	graphics::Buffer bigger;
+	if (!graphics::createBuffer(new_capacity * element_size, usage, bigger)) {
+		return false;
+	}
+
+	graphics::destroyBuffer(buffer);
+	buffer = bigger;
+	capacity = new_capacity;
+	return true;
+}
+
+bool createBuffers() {
+	const VkDeviceSize max_torus_vertices = VkDeviceSize(max_segments) * max_sides;
+
+	if (!graphics::createBuffer(max_torus_vertices * sizeof(mesh::Vertex),
+	                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, torus_vertex_buffer) ||
+	    !graphics::createBuffer(max_torus_vertices * 6 * sizeof(uint32_t),
+	                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, torus_index_buffer)) {
+		return false;
+	}
+
+	const mesh::Mesh floor_mesh = plane::generate();
+	if (!graphics::createBuffer(floor_mesh.vertices.size() * sizeof(mesh::Vertex),
+	                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, floor_vertex_buffer) ||
+	    !graphics::createBuffer(floor_mesh.indices.size() * sizeof(uint32_t),
+	                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, floor_index_buffer)) {
+		return false;
+	}
+	graphics::writeBuffer(floor_vertex_buffer, floor_mesh.vertices.data(),
+	                      floor_mesh.vertices.size() * sizeof(mesh::Vertex));
+	graphics::writeBuffer(floor_index_buffer, floor_mesh.indices.data(),
+	                      floor_mesh.indices.size() * sizeof(uint32_t));
+	floor_index_count = uint32_t(floor_mesh.indices.size());
+
+	point_light_capacity = initial_light_capacity;
+	spot_light_capacity = initial_light_capacity;
+	gizmo_vertex_capacity = initial_gizmo_capacity;
+
+	return graphics::createBuffer(sizeof(shader_data::SceneUniforms),
+	                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, scene_uniform_buffer) &&
+	       graphics::createBuffer(sizeof(shader_data::ModelUniforms),
+	                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, torus_uniform_buffer) &&
+	       graphics::createBuffer(sizeof(shader_data::ModelUniforms),
+	                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, floor_uniform_buffer) &&
+	       graphics::createBuffer(point_light_capacity * sizeof(shader_data::PointLight),
+	                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, point_light_buffer) &&
+	       graphics::createBuffer(spot_light_capacity * sizeof(shader_data::SpotLight),
+	                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spot_light_buffer) &&
+	       graphics::createBuffer(gizmo_vertex_capacity * sizeof(gizmos::Vertex),
+	                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gizmo_vertex_buffer);
+}
+
+bool createDescriptors() {
+	auto& context = graphics::internal::context;
+
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+	};
+
+	const VkDescriptorSetLayoutCreateInfo scene_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+		.pBindings = scene_bindings,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &scene_layout, nullptr,
+	                                &vk_scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create scene descriptor set layout\n";
+		return false;
+	}
+
+	const VkDescriptorSetLayoutBinding model_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo model_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &model_binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &model_layout, nullptr,
+	                                &vk_model_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create model descriptor set layout\n";
+		return false;
+	}
+
+	const VkDescriptorPoolSize pool_sizes[] = {
+		{
+			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 3,
+		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 2,
+		},
+	};
+
+	const VkDescriptorPoolCreateInfo descriptor_pool = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = 3,
+		.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
+		.pPoolSizes = pool_sizes,
+	};
+
+	if (vkCreateDescriptorPool(context.device, &descriptor_pool, nullptr,
+	                           &vk_descriptor_pool) != VK_SUCCESS) {
+		std::cerr << "Failed to create descriptor pool\n";
+		return false;
+	}
+
+	const VkDescriptorSetLayout set_layouts[] = {
+		vk_scene_set_layout,
+		vk_model_set_layout,
+		vk_model_set_layout,
+	};
+
+	const VkDescriptorSetAllocateInfo descriptor_sets = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
+		.pSetLayouts = set_layouts,
+	};
+
+	VkDescriptorSet sets[3];
+	if (vkAllocateDescriptorSets(context.device, &descriptor_sets, sets) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate descriptor sets\n";
+		return false;
+	}
+
+	vk_scene_set = sets[0];
+	vk_torus_set = sets[1];
+	vk_floor_set = sets[2];
+
+	writeBufferDescriptor(vk_scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_uniform_buffer);
+	writeBufferDescriptor(vk_scene_set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, point_light_buffer);
+	writeBufferDescriptor(vk_scene_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spot_light_buffer);
+	writeBufferDescriptor(vk_torus_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, torus_uniform_buffer);
+	writeBufferDescriptor(vk_floor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, floor_uniform_buffer);
+
+	return true;
+}
+
+bool createPipelines() {
+	auto& context = graphics::internal::context;
+
+	const VkDescriptorSetLayout model_set_layouts[] = {
+		vk_scene_set_layout,
+		vk_model_set_layout,
+	};
+
+	const VkPipelineLayoutCreateInfo model_pipeline_layout = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = sizeof(model_set_layouts) / sizeof(model_set_layouts[0]),
+		.pSetLayouts = model_set_layouts,
+	};
+
+	const VkPipelineLayoutCreateInfo gizmo_pipeline_layout = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 1,
+		.pSetLayouts = &vk_scene_set_layout,
+	};
+
+	if (vkCreatePipelineLayout(context.device, &model_pipeline_layout, nullptr,
+	                           &vk_model_pipeline_layout) != VK_SUCCESS ||
+	    vkCreatePipelineLayout(context.device, &gizmo_pipeline_layout, nullptr,
+	                           &vk_gizmo_pipeline_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create pipeline layouts\n";
+		return false;
+	}
+
+	const VkVertexInputAttributeDescription model_attributes[] = {
+		{
+			.location = 0,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(mesh::Vertex, position),
+		},
+		{
+			.location = 1,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(mesh::Vertex, normal),
+		},
+		{
+			.location = 2,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(mesh::Vertex, color),
+		},
+	};
+
+	const VkVertexInputAttributeDescription gizmo_attributes[] = {
+		{
+			.location = 0,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(gizmos::Vertex, position),
+		},
+		{
+			.location = 1,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(gizmos::Vertex, color),
+		},
+	};
+
+	vk_model_pipeline = graphics::createPipeline({
+		.vertex_shader = "shaders/model.vert.spv",
+		.fragment_shader = "shaders/model.frag.spv",
+		.vertex_stride = sizeof(mesh::Vertex),
+		.attributes = model_attributes,
+		.attribute_count = sizeof(model_attributes) / sizeof(model_attributes[0]),
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.cull_mode = VK_CULL_MODE_BACK_BIT,
+		.layout = vk_model_pipeline_layout,
+	});
+
+	vk_gizmo_triangle_pipeline = graphics::createPipeline({
+		.vertex_shader = "shaders/gizmo.vert.spv",
+		.fragment_shader = "shaders/gizmo.frag.spv",
+		.vertex_stride = sizeof(gizmos::Vertex),
+		.attributes = gizmo_attributes,
+		.attribute_count = sizeof(gizmo_attributes) / sizeof(gizmo_attributes[0]),
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.cull_mode = VK_CULL_MODE_NONE,
+		.layout = vk_gizmo_pipeline_layout,
+	});
+
+	vk_gizmo_line_pipeline = graphics::createPipeline({
+		.vertex_shader = "shaders/gizmo.vert.spv",
+		.fragment_shader = "shaders/gizmo.frag.spv",
+		.vertex_stride = sizeof(gizmos::Vertex),
+		.attributes = gizmo_attributes,
+		.attribute_count = sizeof(gizmo_attributes) / sizeof(gizmo_attributes[0]),
+		.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+		.cull_mode = VK_CULL_MODE_NONE,
+		.layout = vk_gizmo_pipeline_layout,
+	});
+
+	return vk_model_pipeline != VK_NULL_HANDLE &&
+	       vk_gizmo_triangle_pipeline != VK_NULL_HANDLE &&
+	       vk_gizmo_line_pipeline != VK_NULL_HANDLE;
+}
+
+void uploadMesh() {
+	torus_parameters.segments = std::clamp(torus_parameters.segments, 3, max_segments);
+	torus_parameters.sides = std::clamp(torus_parameters.sides, 3, max_sides);
+
+	const mesh::Mesh torus_mesh = torus::generate(torus_parameters);
+
+	graphics::writeBuffer(torus_vertex_buffer, torus_mesh.vertices.data(),
+	                      torus_mesh.vertices.size() * sizeof(mesh::Vertex));
+	graphics::writeBuffer(torus_index_buffer, torus_mesh.indices.data(),
+	                      torus_mesh.indices.size() * sizeof(uint32_t));
+	torus_index_count = uint32_t(torus_mesh.indices.size());
+}
+
+math::Vector3 trajectoryOffset(float t) {
+	const float a = animation.radius;
+	const float d = animation.depth;
+
+	switch (animation.trajectory) {
+	case TrajectoryCircle:
+		return { a * std::cos(t), 0.0f, a * std::sin(t) };
+
+	case TrajectoryLissajous:
+		return {
+			a * std::sin(float(animation.frequency_x) * t + math::pi / 2.0f),
+			a * std::sin(float(animation.frequency_y) * t),
+			d * std::sin(t),
+		};
+
+	case TrajectoryRose: {
+		const float rho = a * std::cos(float(animation.petals) * t);
+		return { rho * std::cos(t), rho * std::sin(t), d * std::sin(t) };
+	}
+
+	default:
+		return { 0.0f, 0.0f, 0.0f };
+	}
+}
+
+void computeModelMatrices() {
+	const float t = animation.time;
+
+	const math::Vector3 position = transform.position + trajectoryOffset(t);
+	const math::Vector3 angles = transform.rotation_degrees + animation.spin_degrees_per_second * t;
+	const math::Vector3 inverse_scale = {
+		1.0f / transform.scale.x,
+		1.0f / transform.scale.y,
+		1.0f / transform.scale.z,
+	};
+
+	const math::Matrix4 rotation = math::Matrix4::rotationZ(math::radians(angles.z)) *
+	                               math::Matrix4::rotationY(math::radians(angles.y)) *
+	                               math::Matrix4::rotationX(math::radians(angles.x));
+
+	torus_model = math::Matrix4::translation(position) * rotation * math::Matrix4::scale(transform.scale);
+	torus_normal_matrix = rotation * math::Matrix4::scale(inverse_scale);
+
+	floor_model = math::Matrix4::translation({ 0.0f, floor_settings.height, 0.0f }) *
+	              math::Matrix4::scale({ floor_settings.size, 1.0f, floor_settings.size });
+	floor_normal_matrix = math::Matrix4::scale({ 1.0f / floor_settings.size, 1.0f, 1.0f / floor_settings.size });
+}
+
+math::Matrix4 computeViewProjection(float aspect) {
+	const math::Vector3 angles = camera.rotation_degrees;
+	const math::Matrix4 view = math::Matrix4::rotationZ(math::radians(-angles.z)) *
+	                           math::Matrix4::rotationX(math::radians(-angles.x)) *
+	                           math::Matrix4::rotationY(math::radians(-angles.y)) *
+	                           math::Matrix4::translation(camera.position * -1.0f);
+
+	const float fov = math::radians(camera.fov_degrees);
+	math::Matrix4 proj;
+
+	if (camera.mode == ProjectionPerspective) {
+		proj = math::Matrix4::perspective(fov, aspect, camera.z_near, camera.z_far);
+	} else {
+		const float half_height = math::length(CameraSettings{}.position) * std::tan(fov / 2.0f);
+		const float half_width = half_height * aspect;
+		proj = math::Matrix4::orthographic(-half_width, half_width, -half_height, half_height,
+		                                   camera.z_near, camera.z_far);
+	}
+
+	return proj * view;
+}
+
+void editMaterial(Material& material) {
+	ImGui::ColorEdit3("Albedo", &material.albedo.x);
+	ImGui::ColorEdit3("Specular", &material.specular.x);
+	ImGui::SliderFloat("Shininess", &material.shininess, 1.0f, 256.0f, "%.0f",
+	                   ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+}
+
+void drawInterface() {
+	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(400.0f, 700.0f), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Lab 2: Camera and lighting");
+
+	ImGui::Text("%.1f FPS", double(ImGui::GetIO().Framerate));
+
+	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::PushID("camera");
+		ImGui::RadioButton("Perspective", &camera.mode, ProjectionPerspective);
+		ImGui::SameLine();
+		ImGui::RadioButton("Orthographic", &camera.mode, ProjectionOrthographic);
+		ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
+		ImGui::DragFloat3("Rotation (deg)", &camera.rotation_degrees.x, 0.5f);
+		ImGui::SliderFloat("FOV (deg)", &camera.fov_degrees, 20.0f, 120.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Near", &camera.z_near, 0.01f, 5.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Far", &camera.z_far, 10.0f, 200.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+		if (ImGui::Button("Reset camera")) {
+			camera = CameraSettings{};
+		}
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::PushID("ambient");
+		ImGui::ColorEdit3("Color", &ambient.color.x);
+		ImGui::SliderFloat("Intensity", &ambient.intensity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Directional light", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::PushID("directional");
+		ImGui::DragFloat3("Direction", &directional.direction.x, 0.01f, -1.0f, 1.0f);
+		ImGui::ColorEdit3("Color", &directional.color.x);
+		ImGui::SliderFloat("Intensity", &directional.intensity, 0.0f, 5.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::PushID("point");
+		if (ImGui::Button("Add point light")) {
+			point_lights.push_back({ { 0.0f, -3.5f, -2.0f }, { 1.0f, 1.0f, 1.0f }, 4.0f });
+		}
+		int remove_index = -1;
+		for (int i = 0; i < int(point_lights.size()); ++i) {
+			PointLightSettings& light = point_lights[size_t(i)];
+			ImGui::PushID(i);
+			if (ImGui::TreeNodeEx("light", ImGuiTreeNodeFlags_DefaultOpen, "Point light %d", i)) {
+				ImGui::DragFloat3("Position", &light.position.x, 0.05f);
+				ImGui::ColorEdit3("Color", &light.color.x);
+				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+				if (ImGui::Button("Remove")) {
+					remove_index = i;
+				}
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+		}
+		if (remove_index >= 0) {
+			point_lights.erase(point_lights.begin() + remove_index);
+		}
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::PushID("spot");
+		if (ImGui::Button("Add spot light")) {
+			spot_lights.push_back({ { 0.0f, -3.5f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 20.0f, 15.0f, 25.0f });
+		}
+		int remove_index = -1;
+		for (int i = 0; i < int(spot_lights.size()); ++i) {
+			SpotLightSettings& light = spot_lights[size_t(i)];
+			ImGui::PushID(i);
+			if (ImGui::TreeNodeEx("light", ImGuiTreeNodeFlags_DefaultOpen, "Spot light %d", i)) {
+				ImGui::DragFloat3("Position", &light.position.x, 0.05f);
+				ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f);
+				ImGui::ColorEdit3("Color", &light.color.x);
+				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+				ImGui::SliderFloat("Inner angle", &light.inner_degrees, 0.0f, 85.0f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
+				ImGui::SliderFloat("Outer angle", &light.outer_degrees, 0.0f, 85.0f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
+				if (ImGui::Button("Remove")) {
+					remove_index = i;
+				}
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+		}
+		if (remove_index >= 0) {
+			spot_lights.erase(spot_lights.begin() + remove_index);
+		}
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Light sources", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Show light sources", &show_gizmos);
+	}
+
+	if (ImGui::CollapsingHeader("Torus")) {
+		ImGui::PushID("torus");
+
+		ImGui::SeparatorText("Material");
+		editMaterial(torus_appearance.material);
+		ImGui::Checkbox("Procedural vertex colors", &torus_appearance.use_vertex_colors);
+
+		ImGui::SeparatorText("Transform");
+		ImGui::DragFloat3("Position", &transform.position.x, 0.01f);
+		ImGui::DragFloat3("Rotation (deg)", &transform.rotation_degrees.x, 0.5f);
+		ImGui::DragFloat3("Scale", &transform.scale.x, 0.01f, 0.05f, 5.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (ImGui::Button("Reset transform")) {
+			transform.position = { 0.0f, 0.0f, 0.0f };
+			transform.rotation_degrees = { 60.0f, 0.0f, 0.0f };
+			transform.scale = { 1.0f, 1.0f, 1.0f };
+		}
+
+		ImGui::SeparatorText("Animation");
+		if (ImGui::Button(animation.playing ? "Pause" : "Play")) {
+			animation.playing = !animation.playing;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Restart")) {
+			animation.time = 0.0f;
+		}
+		ImGui::SliderFloat("Speed", &animation.speed, 0.0f, 5.0f);
+		ImGui::Combo("Trajectory", &animation.trajectory, "None\0Circle\0Lissajous\0Rose\0");
+		ImGui::SliderFloat("Radius", &animation.radius, 0.0f, 4.0f);
+		if (animation.trajectory == TrajectoryLissajous || animation.trajectory == TrajectoryRose) {
+			ImGui::SliderFloat("Depth amplitude", &animation.depth, 0.0f, 3.0f);
+		}
+		if (animation.trajectory == TrajectoryLissajous) {
+			ImGui::SliderInt("Frequency X", &animation.frequency_x, 1, 7);
+			ImGui::SliderInt("Frequency Y", &animation.frequency_y, 1, 7);
+		}
+		if (animation.trajectory == TrajectoryRose) {
+			ImGui::SliderInt("Rose k", &animation.petals, 1, 8);
+		}
+		ImGui::DragFloat3("Spin (deg/s)", &animation.spin_degrees_per_second.x, 1.0f, -360.0f, 360.0f);
+
+		ImGui::SeparatorText("Mesh");
+		if (ImGui::SliderFloat("Major radius R", &torus_parameters.major_radius, 0.2f, 3.0f,
+		                       "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+			mesh_dirty = true;
+		}
+		if (ImGui::SliderFloat("Minor radius r", &torus_parameters.minor_radius, 0.05f, 1.5f,
+		                       "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+			mesh_dirty = true;
+		}
+		if (ImGui::SliderInt("Segments", &torus_parameters.segments, 3, max_segments,
+		                     "%d", ImGuiSliderFlags_AlwaysClamp)) {
+			mesh_dirty = true;
+		}
+		if (ImGui::SliderInt("Sides", &torus_parameters.sides, 3, max_sides,
+		                     "%d", ImGuiSliderFlags_AlwaysClamp)) {
+			mesh_dirty = true;
+		}
+		ImGui::Text("%d vertices, %u triangles",
+		            torus_parameters.segments * torus_parameters.sides, torus_index_count / 3);
+
+		ImGui::PopID();
+	}
+
+	if (ImGui::CollapsingHeader("Floor")) {
+		ImGui::PushID("floor");
+		editMaterial(floor_settings.material);
+		ImGui::SliderFloat("Height", &floor_settings.height, -5.0f, 5.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Size", &floor_settings.size, 1.0f, 20.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::PopID();
+	}
+
+	ImGui::End();
+}
+
+math::Vector3 brightColor(math::Vector3 color) {
+	const float brightest = std::max({ color.x, color.y, color.z });
+	return brightest > 1e-4f ? color * (1.0f / brightest) : color;
+}
+
+void uploadLights() {
+	std::vector<shader_data::PointLight> points;
+	points.reserve(point_lights.size());
+	for (const PointLightSettings& light : point_lights) {
+		points.push_back({ light.position, light.intensity, light.color, 0.0f });
+	}
+
+	std::vector<shader_data::SpotLight> spots;
+	spots.reserve(spot_lights.size());
+	for (const SpotLightSettings& light : spot_lights) {
+		spots.push_back({
+			light.position,
+			light.intensity,
+			math::normalize(light.direction),
+			std::cos(math::radians(light.inner_degrees)),
+			light.color,
+			std::cos(math::radians(light.outer_degrees)),
+		});
+	}
+
+	if (growBuffer(point_light_buffer, point_light_capacity, points.size(),
+	               sizeof(shader_data::PointLight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+		writeBufferDescriptor(vk_scene_set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, point_light_buffer);
+	}
+	if (growBuffer(spot_light_buffer, spot_light_capacity, spots.size(),
+	               sizeof(shader_data::SpotLight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+		writeBufferDescriptor(vk_scene_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spot_light_buffer);
+	}
+
+	points.resize(std::min(points.size(), size_t(point_light_capacity)));
+	spots.resize(std::min(spots.size(), size_t(spot_light_capacity)));
+
+	if (!points.empty()) {
+		graphics::writeBuffer(point_light_buffer, points.data(), points.size() * sizeof(shader_data::PointLight));
+	}
+	if (!spots.empty()) {
+		graphics::writeBuffer(spot_light_buffer, spots.data(), spots.size() * sizeof(shader_data::SpotLight));
+	}
+}
+
+void uploadGizmos() {
+	std::vector<gizmos::Vertex> triangles;
+	std::vector<gizmos::Vertex> lines;
+
+	if (show_gizmos) {
+		for (const PointLightSettings& light : point_lights) {
+			gizmos::appendCube(triangles, light.position, gizmo_cube_half_size, brightColor(light.color));
+		}
+		for (const SpotLightSettings& light : spot_lights) {
+			gizmos::appendCube(triangles, light.position, gizmo_cube_half_size, brightColor(light.color));
+			gizmos::appendCone(lines, light.position, light.direction, math::radians(light.outer_degrees),
+			                   gizmo_cone_length, { 1.0f, 1.0f, 1.0f });
+		}
+	}
+
+	std::vector<gizmos::Vertex> vertices = triangles;
+	vertices.insert(vertices.end(), lines.begin(), lines.end());
+
+	growBuffer(gizmo_vertex_buffer, gizmo_vertex_capacity, vertices.size(),
+	           sizeof(gizmos::Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+
+	if (vertices.size() > gizmo_vertex_capacity) {
+		triangles.clear();
+		lines.clear();
+		vertices.clear();
+	}
+
+	gizmo_triangle_vertex_count = uint32_t(triangles.size());
+	gizmo_line_vertex_count = uint32_t(lines.size());
+
+	if (!vertices.empty()) {
+		graphics::writeBuffer(gizmo_vertex_buffer, vertices.data(), vertices.size() * sizeof(gizmos::Vertex));
+	}
+}
+
+void writeModelUniforms(const graphics::Buffer& buffer, const math::Matrix4& model,
+                        const math::Matrix4& normal_matrix, const Material& material, bool use_vertex_colors) {
+	const shader_data::ModelUniforms uniforms = {
+		.model = model,
+		.normal_matrix = normal_matrix,
+		.albedo = material.albedo,
+		.shininess = material.shininess,
+		.specular = material.specular,
+		.use_vertex_colors = use_vertex_colors ? 1.0f : 0.0f,
+	};
+	graphics::writeBuffer(buffer, &uniforms, sizeof(uniforms));
+}
+
+void drawMesh(VkCommandBuffer command_buffer, VkDescriptorSet model_set, const graphics::Buffer& vertex_buffer,
+              const graphics::Buffer& index_buffer, uint32_t index_count) {
+	vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_model_pipeline_layout,
+	                        1, 1, &model_set, 0, nullptr);
+
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer.buffer, &offset);
+	vkCmdBindIndexBuffer(command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+	vkCmdDrawIndexed(command_buffer, index_count, 1, 0, 0, 0);
+}
+
+}
+
+bool initialize() {
+	if (!createBuffers() || !createDescriptors() || !createPipelines()) {
+		shutdown();
+		return false;
+	}
+
+	return true;
+}
+
+void shutdown() {
+	auto& context = graphics::internal::context;
+	vkQueueWaitIdle(context.graphics_queue);
+
+	vkDestroyPipeline(context.device, vk_gizmo_line_pipeline, nullptr);
+	vkDestroyPipeline(context.device, vk_gizmo_triangle_pipeline, nullptr);
+	vkDestroyPipeline(context.device, vk_model_pipeline, nullptr);
+	vkDestroyPipelineLayout(context.device, vk_gizmo_pipeline_layout, nullptr);
+	vkDestroyPipelineLayout(context.device, vk_model_pipeline_layout, nullptr);
+	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
+
+	graphics::destroyBuffer(gizmo_vertex_buffer);
+	graphics::destroyBuffer(spot_light_buffer);
+	graphics::destroyBuffer(point_light_buffer);
+	graphics::destroyBuffer(floor_uniform_buffer);
+	graphics::destroyBuffer(torus_uniform_buffer);
+	graphics::destroyBuffer(scene_uniform_buffer);
+	graphics::destroyBuffer(floor_index_buffer);
+	graphics::destroyBuffer(floor_vertex_buffer);
+	graphics::destroyBuffer(torus_index_buffer);
+	graphics::destroyBuffer(torus_vertex_buffer);
+}
+
+void update(double time) {
+	const float dt = previous_time < 0.0 ? 0.0f : float(time - previous_time);
+	previous_time = time;
+
+	if (animation.playing) {
+		animation.time += dt * animation.speed;
+	}
+
+	drawInterface();
+
+	computeModelMatrices();
+}
+
+void render(const graphics::internal::FrameData& fd) {
+	auto& context = graphics::internal::context;
+
+	if (fd.command_buffer == VK_NULL_HANDLE) {
+		return;
+	}
+
+	if (mesh_dirty) {
+		uploadMesh();
+		mesh_dirty = false;
+	}
+
+	uploadLights();
+	uploadGizmos();
+
+	const VkExtent2D extent = context.swapchain_extent;
+	const float aspect = float(extent.width) / float(std::max(extent.height, 1u));
+
+	const shader_data::SceneUniforms scene_uniforms = {
+		.view_projection = computeViewProjection(aspect),
+		.camera_position = camera.position,
+		.point_light_count = uint32_t(std::min(point_lights.size(), size_t(point_light_capacity))),
+		.ambient_color = ambient.color,
+		.ambient_intensity = ambient.intensity,
+		.directional_direction = math::normalize(directional.direction),
+		.spot_light_count = uint32_t(std::min(spot_lights.size(), size_t(spot_light_capacity))),
+		.directional_color = directional.color,
+		.directional_intensity = directional.intensity,
+	};
+	graphics::writeBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
+
+	writeModelUniforms(torus_uniform_buffer, torus_model, torus_normal_matrix,
+	                   torus_appearance.material, torus_appearance.use_vertex_colors);
+	writeModelUniforms(floor_uniform_buffer, floor_model, floor_normal_matrix,
+	                   floor_settings.material, false);
+
+	vkResetCommandBuffer(fd.command_buffer, 0);
+
+	const VkCommandBufferBeginInfo command_buffer_begin = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+
+	vkBeginCommandBuffer(fd.command_buffer, &command_buffer_begin);
+
+	const VkClearValue clear_values[] = {
+		{ .color = { .float32 = { 0.1f, 0.1f, 0.1f, 1.0f } } },
+		{ .depthStencil = { 1.0f, 0 } },
+	};
+
+	const VkRenderPassBeginInfo render_pass_begin = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass = context.render_pass,
+		.framebuffer = fd.framebuffer,
+		.renderArea = { .extent = extent },
+		.clearValueCount = sizeof(clear_values) / sizeof(clear_values[0]),
+		.pClearValues = clear_values,
+	};
+
+	vkCmdBeginRenderPass(fd.command_buffer, &render_pass_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	const VkViewport viewport = {
+		.x = 0.0f,
+		.y = 0.0f,
+		.width = float(extent.width),
+		.height = float(extent.height),
+		.minDepth = 0.0f,
+		.maxDepth = 1.0f,
+	};
+	vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
+
+	const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
+	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
+
+	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_model_pipeline);
+	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_model_pipeline_layout,
+	                        0, 1, &vk_scene_set, 0, nullptr);
+
+	drawMesh(fd.command_buffer, vk_torus_set, torus_vertex_buffer, torus_index_buffer, torus_index_count);
+	drawMesh(fd.command_buffer, vk_floor_set, floor_vertex_buffer, floor_index_buffer, floor_index_count);
+
+	if (gizmo_triangle_vertex_count + gizmo_line_vertex_count > 0) {
+		const VkDeviceSize offset = 0;
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &gizmo_vertex_buffer.buffer, &offset);
+
+		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_gizmo_triangle_pipeline);
+		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_gizmo_pipeline_layout,
+		                        0, 1, &vk_scene_set, 0, nullptr);
+		if (gizmo_triangle_vertex_count > 0) {
+			vkCmdDraw(fd.command_buffer, gizmo_triangle_vertex_count, 1, 0, 0);
+		}
+
+		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_gizmo_line_pipeline);
+		if (gizmo_line_vertex_count > 0) {
+			vkCmdDraw(fd.command_buffer, gizmo_line_vertex_count, 1, gizmo_triangle_vertex_count, 0);
+		}
+	}
+
+	vkCmdEndRenderPass(fd.command_buffer);
+
+	vkEndCommandBuffer(fd.command_buffer);
+}
+
+} // namespace application
